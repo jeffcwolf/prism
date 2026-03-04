@@ -25,6 +25,18 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Show project statistics dashboard.
+    Stats {
+        /// Path to the codebase to analyze.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output JSON instead of human-readable summary.
+        #[arg(long)]
+        json: bool,
+        /// Skip dependency analysis.
+        #[arg(long)]
+        no_deps: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -38,6 +50,21 @@ fn main() -> Result<()> {
         Command::Deps { path } => {
             let report = prism_deps::analyze_dependencies(&path)?;
             print_deps_report(&report);
+        }
+        Command::Stats {
+            path,
+            json,
+            no_deps,
+        } => {
+            let config = prism_stats::StatsConfig::new(path)
+                .with_skip_deps(no_deps)
+                .with_json(json);
+            let stats = prism_stats::collect_stats(&config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                print!("{stats}");
+            }
         }
     }
 
