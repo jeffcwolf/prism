@@ -77,8 +77,11 @@ fn extract_project_name(cargo_content: &str, path: &Path) -> String {
         }
     }
 
-    // Fall back to directory name
-    path.file_name()
+    // Fall back to directory name, canonicalizing first so that "." resolves
+    // to an actual directory name instead of returning None.
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string()
@@ -89,7 +92,13 @@ fn is_excluded_dir(entry: &walkdir::DirEntry) -> bool {
         return false;
     }
     let name = entry.file_name().to_str().unwrap_or("");
-    name == "target" || name.starts_with('.') || name == "node_modules"
+    if name == "target" || name.starts_with('.') || name == "node_modules" {
+        return true;
+    }
+    if name == "fixtures" {
+        return entry.path().components().any(|c| c.as_os_str() == "tests");
+    }
+    false
 }
 
 /// Counts logical lines: non-blank, non-comment lines.
@@ -227,5 +236,47 @@ fn foo() {
         let content = "[workspace]\nmembers = [\"a\"]\n";
         let name = extract_project_name(content, Path::new("/home/user/my-project"));
         assert_eq!(name, "my-project");
+    }
+
+    #[test]
+    fn extract_name_from_dot_path_uses_canonicalized_dir() {
+        let content = "[workspace]\nmembers = [\"a\"]\n";
+        // Path::new(".").file_name() returns None, but canonicalize resolves
+        // to an actual directory name.
+        let name = extract_project_name(content, Path::new("."));
+        assert_ne!(
+            name, "unknown",
+            "dot path should resolve to a real directory name, not unknown"
+        );
+    }
+
+    #[test]
+    fn collect_excludes_test_fixtures() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Create a tests/fixtures directory with Rust files that should be excluded
+        fs::create_dir_all(root.join("tests/fixtures/fake_crate/src")).unwrap();
+        fs::write(
+            root.join("tests/fixtures/fake_crate/src/lib.rs"),
+            "pub fn fixture_code() {}\npub fn more_fixture_code() {}\n",
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.files, 1,
+            "should only count src/main.rs, not fixture files"
+        );
+        assert_eq!(stats.rust_lines, 1, "should only count lines from src/");
     }
 }

@@ -51,7 +51,13 @@ fn is_excluded(entry: &walkdir::DirEntry) -> bool {
         return false;
     }
     let name = entry.file_name().to_str().unwrap_or("");
-    name == "target" || name.starts_with('.') || name == "node_modules"
+    if name == "target" || name.starts_with('.') || name == "node_modules" {
+        return true;
+    }
+    if name == "fixtures" {
+        return entry.path().components().any(|c| c.as_os_str() == "tests");
+    }
+    false
 }
 
 #[derive(Default)]
