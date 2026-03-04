@@ -5,6 +5,9 @@ members = [
     "crates/prism-deps",
 ]
 resolver = "2"
+exclude = [
+    "crates/prism-cli/tests/fixtures/deps_project",
+]
 
 [workspace.dependencies]
 prism-audit = { path = "crates/prism-audit" }
@@ -12,3 +15,8 @@ prism-deps = { path = "crates/prism-deps" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+cargo_metadata = "0.19"
+semver = "1"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,9 @@
+[package]
+name = "deps-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+log = "0.4"

@@ -35,12 +35,133 @@ fn main() -> Result<()> {
             let report = prism_audit::audit_codebase(&path)?;
             print_audit_report(&report);
         }
-        Command::Deps { path: _ } => {
-            anyhow::bail!("deps subcommand is not yet implemented");
+        Command::Deps { path } => {
+            let report = prism_deps::analyze_dependencies(&path)?;
+            print_deps_report(&report);
         }
     }
 
     Ok(())
+}
+
+fn print_deps_report(report: &prism_deps::DepsReport) {
+    println!("Prism Dependency Health Report");
+    println!("{}", "=".repeat(72));
+
+    let graph = report.graph();
+    println!(
+        "Dependencies: {} direct, {} total  |  Max tree depth: {}",
+        graph.direct_count(),
+        graph.total_count(),
+        graph.max_depth()
+    );
+    println!();
+
+    if !report.dependencies().is_empty() {
+        println!("Direct Dependencies:");
+        println!("{}", "-".repeat(72));
+
+        for dep in report.dependencies() {
+            let health = report.health().iter().find(|h| h.name() == dep.name());
+
+            let status = health
+                .map(|h| h.status())
+                .unwrap_or(prism_deps::HealthStatus::Healthy);
+
+            let status_tag = match status {
+                prism_deps::HealthStatus::Healthy => "  OK  ",
+                prism_deps::HealthStatus::Stale => " STALE",
+                prism_deps::HealthStatus::Bloated => " BLOAT",
+                prism_deps::HealthStatus::Vulnerable => " VULN ",
+            };
+
+            println!(
+                "  [{}] {:<30} v{:<12} ({}, {})",
+                status_tag,
+                dep.name(),
+                dep.version(),
+                dep.source(),
+                dep.kind()
+            );
+
+            if let Some(h) = health {
+                if let Some(staleness) = h.staleness() {
+                    println!(
+                        "         -> latest: v{} {}",
+                        staleness.latest_version(),
+                        if staleness.is_major_behind() {
+                            "(MAJOR version behind)"
+                        } else {
+                            "(outdated)"
+                        }
+                    );
+                }
+
+                for vuln in h.vulnerabilities() {
+                    println!(
+                        "         -> {} [{}]: {}",
+                        vuln.advisory_id(),
+                        vuln.severity(),
+                        vuln.title()
+                    );
+                }
+
+                let tc = h.transitive_count();
+                if tc >= 50 {
+                    println!(
+                        "         -> pulls in {} transitive dependencies (bloat risk)",
+                        tc
+                    );
+                }
+            }
+        }
+        println!();
+    }
+
+    if !report.duplicates().is_empty() {
+        println!("Duplicate Dependencies:");
+        println!("{}", "-".repeat(72));
+        for dup in report.duplicates() {
+            println!("  {} — versions: {}", dup.name(), dup.versions().join(", "));
+        }
+        println!();
+    }
+
+    println!("{}", "=".repeat(72));
+
+    if report.is_healthy() {
+        println!("All dependencies are healthy.");
+    } else {
+        let vuln_count = report
+            .health()
+            .iter()
+            .filter(|h| h.status() == prism_deps::HealthStatus::Vulnerable)
+            .count();
+        let stale_count = report
+            .health()
+            .iter()
+            .filter(|h| h.status() == prism_deps::HealthStatus::Stale)
+            .count();
+        let bloat_count = report
+            .health()
+            .iter()
+            .filter(|h| h.status() == prism_deps::HealthStatus::Bloated)
+            .count();
+        let dup_count = report.duplicates().len();
+
+        if vuln_count > 0 {
+            println!("WARNING: {} vulnerable dependency(ies)", vuln_count);
+        }
+        if stale_count > 0 {
+            println!("WARNING: {} stale dependency(ies)", stale_count);
+        }
+        if bloat_count > 0 {
+            println!("WARNING: {} bloated dependency(ies)", bloat_count);
+        }
+        if dup_count > 0 {
+            println!("WARNING: {} duplicate dependency(ies)", dup_count);
+        }
+    }
 }
 
 fn print_audit_report(report: &prism_audit::AuditReport) {
