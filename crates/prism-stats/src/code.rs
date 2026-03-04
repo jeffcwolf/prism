@@ -77,8 +77,10 @@ fn extract_project_name(cargo_content: &str, path: &Path) -> String {
         }
     }
 
-    // Fall back to directory name
-    path.file_name()
+    // Fall back to directory name, canonicalizing to resolve "."
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string()
