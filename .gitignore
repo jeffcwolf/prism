@@ -1,0 +1,19 @@
+# Cargo / Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Prism local data
+.prism/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
