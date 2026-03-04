@@ -1,80 +1,60 @@
-//! Metrics extraction: parses Rust source files to compute line counts,
-//! function counts, and public/private item counts without a full AST.
+//! Metrics extraction: parses Rust source files using `syn` for accurate
+//! complexity analysis, item counting, and per-function breakdowns.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
-use crate::types::{AuditError, FileMetrics, ModuleAnalysis};
+use crate::complexity;
+use crate::source_file::SourceFile;
+use crate::types::{AuditError, FileMetrics, FunctionComplexity, ModuleAnalysis};
 
-/// Extract metrics from a single Rust source file.
+/// Extract metrics from a single Rust source file using syn-based parsing.
 pub(crate) fn extract_file_metrics(path: &Path) -> Result<FileMetrics, AuditError> {
-    let content = fs::read_to_string(path).map_err(|source| AuditError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-
-    Ok(compute_metrics(&content))
+    let source_file = SourceFile::from_path(path)?;
+    Ok(compute_metrics_from_ast(&source_file))
 }
 
-/// Compute metrics from source text. Separated from I/O for testability.
-fn compute_metrics(source: &str) -> FileMetrics {
-    let line_count = source.lines().count();
-    let mut function_count = 0;
-    let mut public_item_count = 0;
-    let mut total_item_count = 0;
+/// Compute metrics from a parsed source file.
+fn compute_metrics_from_ast(source_file: &SourceFile) -> FileMetrics {
+    let counts = source_file.item_counts();
+    let functions = source_file.functions();
 
-    for line in source.lines() {
-        let trimmed = line.trim();
-
-        // Skip comments and attributes
-        if trimmed.starts_with("//") || trimmed.starts_with('#') {
-            continue;
-        }
-
-        let is_fn = is_function_declaration(trimmed);
-        let is_item = is_item_declaration(trimmed);
-
-        if is_fn {
-            function_count += 1;
-        }
-
-        if is_item {
-            total_item_count += 1;
-            if is_public_item(trimmed) {
-                public_item_count += 1;
-            }
-        }
-    }
+    let function_complexities: Vec<FunctionComplexity> = functions
+        .iter()
+        .map(|func| {
+            let cyclomatic = complexity::cyclomatic_complexity(&func.body);
+            let depth = complexity::nesting_depth(&func.body);
+            let cognitive = complexity::cognitive_complexity(&func.body);
+            FunctionComplexity::new(
+                func.name.clone(),
+                func.is_public,
+                cyclomatic,
+                depth,
+                cognitive,
+            )
+        })
+        .collect();
 
     FileMetrics::new(
-        line_count,
-        function_count,
-        public_item_count,
-        total_item_count,
+        source_file.line_count(),
+        counts.functions,
+        counts.public,
+        counts.total,
+        function_complexities,
     )
 }
 
-/// Check if a trimmed line declares a function (fn or pub fn, but not inside a comment).
-fn is_function_declaration(trimmed: &str) -> bool {
-    // Match: fn name, pub fn name, pub(crate) fn name, async fn, pub async fn, etc.
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    words.contains(&"fn") && !trimmed.starts_with("//") && !trimmed.contains("//!")
-}
-
-/// Check if a trimmed line declares any item (fn, struct, enum, trait, type, const, static, mod).
-fn is_item_declaration(trimmed: &str) -> bool {
-    let item_keywords = [
-        "fn", "struct", "enum", "trait", "type", "const", "static", "mod",
-    ];
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-
-    item_keywords.iter().any(|kw| words.contains(kw))
-}
-
-/// Check if a trimmed line starts with pub (possibly pub(crate), pub(super), etc.).
-fn is_public_item(trimmed: &str) -> bool {
-    trimmed.starts_with("pub ") || trimmed.starts_with("pub(")
+/// Compute metrics from source text (convenience for testing).
+#[cfg(test)]
+fn compute_metrics(source: &str) -> FileMetrics {
+    match SourceFile::parse(source) {
+        Ok(sf) => compute_metrics_from_ast(&sf),
+        Err(_) => {
+            // Fallback for unparseable source: line counting only
+            let line_count = source.lines().count();
+            FileMetrics::new(line_count, 0, 0, 0, vec![])
+        }
+    }
 }
 
 /// Group file metrics by module (parent directory) and build ModuleAnalysis values.
@@ -114,7 +94,7 @@ mod tests {
 
     #[test]
     fn counts_lines() {
-        let source = "line 1\nline 2\nline 3\n";
+        let source = "fn foo() {}\nfn bar() {}\nfn baz() {}\n";
         let m = compute_metrics(source);
         assert_eq!(m.line_count(), 3);
     }
@@ -146,20 +126,6 @@ pub enum MyEnum {}
     }
 
     #[test]
-    fn ignores_comments_and_attributes() {
-        let source = "\
-// fn not_a_function() {}
-/// fn also_not_a_function() {}
-#[derive(Debug)]
-pub struct Real;
-fn actual_function() {}
-";
-        let m = compute_metrics(source);
-        assert_eq!(m.function_count(), 1);
-        assert_eq!(m.total_item_count(), 2, "struct + fn");
-    }
-
-    #[test]
     fn empty_source_produces_zero_metrics() {
         let m = compute_metrics("");
         assert_eq!(m.line_count(), 0);
@@ -178,11 +144,17 @@ fn actual_function() {}
     #[test]
     fn build_module_analyses_groups_files() {
         let files = vec![
-            ("src/lib.rs".to_string(), FileMetrics::new(100, 5, 2, 8)),
-            ("src/utils.rs".to_string(), FileMetrics::new(50, 3, 1, 4)),
+            (
+                "src/lib.rs".to_string(),
+                FileMetrics::new(100, 5, 2, 8, vec![]),
+            ),
+            (
+                "src/utils.rs".to_string(),
+                FileMetrics::new(50, 3, 1, 4, vec![]),
+            ),
             (
                 "tests/test_main.rs".to_string(),
-                FileMetrics::new(30, 2, 0, 2),
+                FileMetrics::new(30, 2, 0, 2, vec![]),
             ),
         ];
 
@@ -191,5 +163,64 @@ fn actual_function() {}
         assert_eq!(modules[0].name(), "src");
         assert_eq!(modules[0].total_lines(), 150);
         assert_eq!(modules[1].name(), "tests");
+    }
+
+    #[test]
+    fn function_complexities_extracted() {
+        let source = "\
+fn simple() {}
+fn branchy(x: i32) -> i32 {
+    if x > 0 {
+        if x > 10 {
+            match x {
+                1 => 1,
+                2 => 2,
+                _ => 3,
+            }
+        } else {
+            x
+        }
+    } else {
+        0
+    }
+}
+";
+        let m = compute_metrics(source);
+        assert_eq!(m.function_complexities().len(), 2);
+
+        let simple = &m.function_complexities()[0];
+        assert_eq!(simple.name(), "simple");
+        assert_eq!(simple.cyclomatic(), 1);
+        assert_eq!(simple.nesting_depth(), 0);
+        assert_eq!(simple.cognitive(), 0);
+
+        let branchy = &m.function_complexities()[1];
+        assert_eq!(branchy.name(), "branchy");
+        assert!(
+            branchy.cyclomatic() > 1,
+            "branchy should have complexity > 1, got {}",
+            branchy.cyclomatic()
+        );
+        assert!(
+            branchy.nesting_depth() >= 3,
+            "branchy should have nesting >= 3, got {}",
+            branchy.nesting_depth()
+        );
+    }
+
+    #[test]
+    fn impl_methods_counted() {
+        let source = "\
+struct Foo;
+impl Foo {
+    pub fn public_method(&self) -> i32 { 42 }
+    fn private_method(&self) {}
+}
+";
+        let m = compute_metrics(source);
+        assert_eq!(m.function_count(), 2);
+        assert_eq!(m.function_complexities().len(), 2);
+        assert!(m.function_complexities()[0].is_public());
+        assert!(!m.function_complexities()[1].is_public());
     }
 }

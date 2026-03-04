@@ -3,11 +3,15 @@
 //! The primary entry point is [`audit_codebase`], which recursively discovers Rust source files,
 //! computes per-file metrics, groups them into modules, and produces an [`AuditReport`].
 
+mod complexity;
 mod discovery;
 mod metrics;
+mod source_file;
 mod types;
 
-pub use types::{AuditError, AuditReport, FileMetrics, ModuleAnalysis};
+pub use types::{
+    AuditError, AuditReport, FileMetrics, Finding, FunctionComplexity, ModuleAnalysis, Severity,
+};
 
 use std::path::Path;
 
