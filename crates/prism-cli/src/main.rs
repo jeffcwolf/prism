@@ -45,7 +45,7 @@ fn main() -> Result<()> {
 
 fn print_audit_report(report: &prism_audit::AuditReport) {
     println!("Prism Audit Report");
-    println!("{}", "=".repeat(60));
+    println!("{}", "=".repeat(72));
     println!(
         "Files scanned: {}  |  Total lines: {}",
         report.total_files(),
@@ -63,21 +63,66 @@ fn print_audit_report(report: &prism_audit::AuditReport) {
             module.total_item_count(),
             module.total_lines()
         );
+
+        let complexities = module.function_complexities();
+        if !complexities.is_empty() {
+            println!("    functions:");
+            for func in &complexities {
+                let vis = if func.is_public() { "pub " } else { "" };
+                println!(
+                    "      {}{:<30} cyclomatic={:<3} depth={:<3} cognitive={}",
+                    vis,
+                    func.name(),
+                    func.cyclomatic(),
+                    func.nesting_depth(),
+                    func.cognitive()
+                );
+            }
+        }
     }
 
     println!();
-    println!("{}", "=".repeat(60));
+
+    let findings = report.findings();
+    if !findings.is_empty() {
+        println!("Findings:");
+        println!("{}", "-".repeat(72));
+        for finding in findings {
+            let prefix = match finding.severity() {
+                prism_audit::Severity::Error => "ERROR",
+                prism_audit::Severity::Warning => "WARN ",
+                prism_audit::Severity::Info => "INFO ",
+            };
+            println!("  [{}] {}", prefix, finding.message());
+        }
+        println!();
+    }
+
+    println!("{}", "=".repeat(72));
 
     let shallow_count = report
         .modules()
         .iter()
         .filter(|m| m.depth_ratio() > 0.5)
         .count();
-    if shallow_count > 0 {
-        println!(
-            "WARNING: {} module(s) flagged as shallow (depth ratio > 0.5)",
-            shallow_count
-        );
+    let warning_count = findings
+        .iter()
+        .filter(|f| f.severity() >= prism_audit::Severity::Warning)
+        .count();
+
+    if shallow_count > 0 || warning_count > 0 {
+        if shallow_count > 0 {
+            println!(
+                "WARNING: {} module(s) flagged as shallow (depth ratio > 0.5)",
+                shallow_count
+            );
+        }
+        if warning_count > 0 {
+            println!(
+                "WARNING: {} finding(s) at warning level or above",
+                warning_count
+            );
+        }
     } else {
         println!("All modules have acceptable depth ratios.");
     }
