@@ -79,10 +79,10 @@ fn no_subcommand_shows_help() {
 }
 
 #[test]
-fn deps_subcommand_not_yet_implemented() {
+fn deps_subcommand_is_implemented() {
     prism_cmd()
         .args(["deps", "."])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success()
+        .stdout(predicate::str::contains("Prism Dependency Health Report"));
 }
