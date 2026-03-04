@@ -50,7 +50,13 @@ fn is_excluded(entry: &walkdir::DirEntry) -> bool {
         return false;
     }
     let name = entry.file_name().to_str().unwrap_or("");
-    name == "target" || name.starts_with('.') || name == "node_modules"
+    if name == "target" || name.starts_with('.') || name == "node_modules" {
+        return true;
+    }
+    if name == "fixtures" {
+        return entry.path().components().any(|c| c.as_os_str() == "tests");
+    }
+    false
 }
 
 struct UnsafeVisitor<'a> {
@@ -114,6 +120,29 @@ unsafe fn dangerous() {}
         assert!(
             stats.locations.iter().any(|l| l.contains("src/lib.rs:9")),
             "should find unsafe fn at line 9"
+        );
+    }
+
+    #[test]
+    fn excludes_test_fixtures_from_unsafe_count() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn safe() {}\n").unwrap();
+
+        // Unsafe code inside tests/fixtures should be excluded
+        fs::create_dir_all(root.join("tests/fixtures/sample/src")).unwrap();
+        fs::write(
+            root.join("tests/fixtures/sample/src/lib.rs"),
+            "unsafe fn dangerous() {}\npub fn with_unsafe() { unsafe { std::ptr::null::<u8>().read(); } }\n",
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.unsafe_blocks, 0,
+            "should not count unsafe code from test fixtures"
         );
     }
 
