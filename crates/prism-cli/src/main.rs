@@ -37,6 +37,21 @@ enum Command {
         #[arg(long)]
         no_deps: bool,
     },
+    /// Map the structural layout of a codebase.
+    Map {
+        /// Path to the codebase to map.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Output as Mermaid diagram.
+        #[arg(long, conflicts_with = "json")]
+        mermaid: bool,
+        /// Limit module tree depth.
+        #[arg(long)]
+        depth: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -64,6 +79,25 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 print!("{stats}");
+            }
+        }
+        Command::Map {
+            path,
+            json,
+            mermaid,
+            depth,
+        } => {
+            let mut config = prism_map::MapConfig::new(path);
+            if let Some(d) = depth {
+                config = config.with_depth_limit(d);
+            }
+            let map = prism_map::map_codebase(&config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&map)?);
+            } else if mermaid {
+                print!("{}", map.to_mermaid());
+            } else {
+                print!("{map}");
             }
         }
     }

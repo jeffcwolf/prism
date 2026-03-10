@@ -4,10 +4,12 @@ members = [
     "crates/prism-audit",
     "crates/prism-deps",
     "crates/prism-stats",
+    "crates/prism-map",
 ]
 resolver = "2"
 exclude = [
     "crates/prism-cli/tests/fixtures/deps_project",
+    "crates/prism-cli/tests/fixtures/map_project",
     "crates/prism-stats/tests/fixtures/simple_crate",
 ]
 
@@ -15,6 +17,7 @@ exclude = [
 prism-audit = { path = "crates/prism-audit" }
 prism-deps = { path = "crates/prism-deps" }
 prism-stats = { path = "crates/prism-stats" }
+prism-map = { path = "crates/prism-map" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
