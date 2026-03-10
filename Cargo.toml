@@ -5,6 +5,7 @@ members = [
     "crates/prism-deps",
     "crates/prism-stats",
     "crates/prism-map",
+    "crates/prism-check",
 ]
 resolver = "2"
 exclude = [
@@ -18,6 +19,7 @@ prism-audit = { path = "crates/prism-audit" }
 prism-deps = { path = "crates/prism-deps" }
 prism-stats = { path = "crates/prism-stats" }
 prism-map = { path = "crates/prism-map" }
+prism-check = { path = "crates/prism-check" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

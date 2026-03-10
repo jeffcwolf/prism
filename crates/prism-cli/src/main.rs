@@ -52,6 +52,30 @@ enum Command {
         #[arg(long)]
         depth: Option<usize>,
     },
+    /// Run release-readiness checks against a codebase.
+    Check {
+        /// Path to the codebase to check.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON (for machine consumption).
+        #[arg(long)]
+        json: bool,
+        /// Path to a prism-check config file (TOML).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Skip dependency checks (useful offline).
+        #[arg(long)]
+        no_deps: bool,
+        /// Skip coverage checks even if tool is available.
+        #[arg(long)]
+        no_coverage: bool,
+        /// Use stricter thresholds.
+        #[arg(long)]
+        strict: bool,
+        /// Include actionable fix suggestions in output.
+        #[arg(long)]
+        fix_suggestions: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -100,9 +124,163 @@ fn main() -> Result<()> {
                 print!("{map}");
             }
         }
+        Command::Check {
+            path,
+            json,
+            config,
+            no_deps,
+            no_coverage,
+            strict,
+            fix_suggestions,
+        } => {
+            let mut check_config = prism_check::CheckConfig::new(path)
+                .with_json(json)
+                .with_no_deps(no_deps)
+                .with_no_coverage(no_coverage)
+                .with_strict(strict)
+                .with_fix_suggestions(fix_suggestions);
+
+            // Load config file if specified, or look for prism-check.toml in project root
+            if let Some(config_path) = config {
+                check_config.load_config_file(&config_path)?;
+            } else {
+                let default_config = check_config.path().join("prism-check.toml");
+                if default_config.exists() {
+                    check_config.load_config_file(&default_config)?;
+                }
+            }
+
+            if strict {
+                check_config.apply_strict();
+            }
+
+            let report = prism_check::run_checks(&check_config);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_check_report(&report, fix_suggestions);
+            }
+
+            if report.overall_status() == prism_check::CheckStatus::Fail {
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_check_report(report: &prism_check::CheckReport, fix_suggestions: bool) {
+    println!("Prism Release Readiness Check");
+    println!("{}", "=".repeat(72));
+    if !report.project_info().is_empty() {
+        println!(
+            "Project: {} ({})",
+            report.project_name(),
+            report.project_info()
+        );
+    } else {
+        println!("Project: {}", report.project_name());
+    }
+    println!();
+
+    let mut current_category = None;
+    for check in report.checks() {
+        let cat = check.category();
+        if current_category != Some(cat) {
+            current_category = Some(cat);
+            println!("{}", category_label(cat));
+        }
+        let icon = match check.status() {
+            prism_check::CheckStatus::Pass => "\u{2713}",
+            prism_check::CheckStatus::Fail => "\u{2717}",
+            prism_check::CheckStatus::Warn => "\u{26A0}",
+            prism_check::CheckStatus::Skip => "\u{2298}",
+        };
+        println!("  {icon} {}", check.message());
+
+        if fix_suggestions
+            && check.status() == prism_check::CheckStatus::Fail
+            && let Some(suggestion) = fix_suggestion_for(check.name())
+        {
+            println!("    \u{2192} {suggestion}");
+        }
+    }
+    println!();
+
+    println!("{}", "=".repeat(72));
+
+    let fail = report.total_fail();
+    let warn = report.total_warn();
+    if fail == 0 && warn == 0 {
+        println!("Result: all checks passed \u{2014} ready for release");
+    } else if fail == 0 {
+        println!("Result: {warn} WARN \u{2014} ready for release (with warnings)");
+    } else {
+        println!("Result: {fail} FAIL, {warn} WARN \u{2014} not ready for release");
+    }
+
+    if fail > 0 {
+        println!();
+        println!("Failures:");
+        for check in report.checks() {
+            if check.status() == prism_check::CheckStatus::Fail {
+                println!(
+                    "  \u{2022} {}: {}",
+                    category_label(check.category()),
+                    check.message()
+                );
+            }
+        }
+    }
+
+    if warn > 0 {
+        println!();
+        println!("Warnings:");
+        for check in report.checks() {
+            if check.status() == prism_check::CheckStatus::Warn {
+                println!(
+                    "  \u{2022} {}: {}",
+                    category_label(check.category()),
+                    check.message()
+                );
+            }
+        }
+    }
+}
+
+fn category_label(cat: prism_check::CheckCategory) -> &'static str {
+    match cat {
+        prism_check::CheckCategory::Quality => "Quality",
+        prism_check::CheckCategory::Dependencies => "Dependencies",
+        prism_check::CheckCategory::Testing => "Testing",
+        prism_check::CheckCategory::Safety => "Safety",
+        prism_check::CheckCategory::Structure => "Structure",
+        prism_check::CheckCategory::Coverage => "Coverage",
+    }
+}
+
+fn fix_suggestion_for(check_name: &str) -> Option<&'static str> {
+    match check_name {
+        "doc_coverage" => {
+            Some("Add doc comments to public items (functions, structs, enums, traits)")
+        }
+        "cyclomatic_complexity" => Some("Consider extracting helper functions to reduce branching"),
+        "cognitive_complexity" => {
+            Some("Consider simplifying by extracting helper functions or using early returns")
+        }
+        "shallow_modules" => Some("Hide implementation details behind a narrower public API"),
+        "vulnerabilities" => Some("Run `cargo audit` and update affected dependencies"),
+        "staleness" => Some("Run `cargo update` to bring dependencies up to date"),
+        "test_ratio" => Some("Add more unit tests to improve test coverage"),
+        "integration_tests" => Some("Add integration tests in the tests/ directory"),
+        "unsafe_blocks" => Some("Consider replacing unsafe code with safe alternatives"),
+        "module_structure" => Some("Ensure all .rs files are reachable via mod declarations"),
+        "orphan_files" => Some("Remove orphan files or add mod declarations to include them"),
+        "line_coverage" => Some("Install cargo-tarpaulin and increase test coverage"),
+        _ => None,
+    }
 }
 
 fn print_deps_report(report: &prism_deps::DepsReport) {
