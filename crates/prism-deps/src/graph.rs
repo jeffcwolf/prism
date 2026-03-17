@@ -3,6 +3,10 @@
 //! Invokes `cargo metadata` on a project, extracts the direct dependencies
 //! and their metadata, computes the dependency tree structure including
 //! maximum depth and per-dependency transitive counts.
+//!
+//! Both single-crate projects and virtual workspaces (no root package) are
+//! supported. For virtual workspaces, dependencies are aggregated across all
+//! workspace members; internal crate-to-crate edges are excluded.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -32,6 +36,11 @@ pub(crate) fn load_metadata(path: &Path) -> Result<cargo_metadata::Metadata, Dep
 }
 
 /// Extract direct dependencies and compute dependency graph metrics.
+///
+/// Handles both single-crate projects (with a root package) and virtual
+/// workspaces (no root package). For virtual workspaces, dependencies are
+/// aggregated across all workspace members; internal workspace crate edges
+/// are excluded from the results.
 pub(crate) fn build_dependency_info(
     metadata: &cargo_metadata::Metadata,
 ) -> Result<(Vec<DirectDependency>, DependencyGraph), DepsError> {
@@ -42,61 +51,150 @@ pub(crate) fn build_dependency_info(
             message: "no dependency resolution found in metadata".to_string(),
         })?;
 
-    // Find the root package(s)
-    let root_id = resolve
-        .root
-        .as_ref()
-        .ok_or_else(|| DepsError::MetadataError {
-            message: "no root package found; is this a virtual workspace?".to_string(),
-        })?;
-
-    let root_node = resolve
-        .nodes
-        .iter()
-        .find(|n| &n.id == root_id)
-        .ok_or_else(|| DepsError::MetadataError {
-            message: "root package not found in resolve graph".to_string(),
-        })?;
-
-    // Build a lookup from package ID to package
+    // Build shared lookups used by both the single-root and virtual paths.
     let package_map: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Package> =
         metadata.packages.iter().map(|p| (&p.id, p)).collect();
 
-    // Build a lookup from package ID to resolve node
     let node_map: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Node> =
         resolve.nodes.iter().map(|n| (&n.id, n)).collect();
 
-    // Extract direct dependencies from the root node
-    let root_package = package_map
-        .get(root_id)
-        .ok_or_else(|| DepsError::MetadataError {
-            message: "root package not found in package list".to_string(),
-        })?;
+    match resolve.root.as_ref() {
+        // ── Single-crate project: use the root package directly ───────────────
+        Some(root_id) => {
+            let root_node = resolve
+                .nodes
+                .iter()
+                .find(|n| &n.id == root_id)
+                .ok_or_else(|| DepsError::MetadataError {
+                    message: "root package not found in resolve graph".to_string(),
+                })?;
 
-    let direct_deps = extract_direct_dependencies(root_package, root_node, &package_map);
+            let root_package = package_map
+                .get(root_id)
+                .ok_or_else(|| DepsError::MetadataError {
+                    message: "root package not found in package list".to_string(),
+                })?;
 
-    // Compute graph metrics
-    let total_count = resolve.nodes.len().saturating_sub(1); // exclude root
+            let direct_deps =
+                extract_direct_dependencies(root_package, root_node, &package_map);
+
+            let total_count = resolve.nodes.len().saturating_sub(1); // exclude root
+            let direct_count = direct_deps.len();
+            let max_depth = compute_max_depth(root_id, &node_map);
+            let transitive_counts = compute_transitive_counts(root_node, &node_map);
+
+            let graph =
+                DependencyGraph::new(total_count, direct_count, max_depth, transitive_counts);
+
+            Ok((direct_deps, graph))
+        }
+
+        // ── Virtual workspace: aggregate across all workspace members ─────────
+        None => {
+            let workspace_ids: HashSet<&cargo_metadata::PackageId> =
+                metadata.workspace_members.iter().collect();
+
+            build_dependency_info_for_virtual_workspace(
+                metadata,
+                &workspace_ids,
+                &package_map,
+                &node_map,
+                resolve,
+            )
+        }
+    }
+}
+
+/// Build dependency info for a virtual workspace by aggregating across all
+/// workspace members. Internal crate-to-crate edges are excluded.
+fn build_dependency_info_for_virtual_workspace<'a>(
+    metadata: &'a cargo_metadata::Metadata,
+    workspace_ids: &HashSet<&'a cargo_metadata::PackageId>,
+    package_map: &HashMap<&'a cargo_metadata::PackageId, &'a cargo_metadata::Package>,
+    node_map: &HashMap<&'a cargo_metadata::PackageId, &'a cargo_metadata::Node>,
+    resolve: &'a cargo_metadata::Resolve,
+) -> Result<(Vec<DirectDependency>, DependencyGraph), DepsError> {
+    // Collect external direct deps from all workspace members, deduplicating
+    // by name. The first occurrence of a given dep name wins.
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut direct_deps: Vec<DirectDependency> = Vec::new();
+    let mut all_transitive_counts: HashMap<String, usize> = HashMap::new();
+
+    for member_id in &metadata.workspace_members {
+        let member_package = match package_map.get(member_id) {
+            Some(p) => p,
+            None => continue,
+        };
+        let member_node = match node_map.get(member_id) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let member_deps =
+            extract_direct_dependencies(member_package, member_node, package_map);
+        let member_transitive = compute_transitive_counts(member_node, node_map);
+
+        for dep in member_deps {
+            // Skip internal workspace crate dependencies.
+            let is_internal = package_map.values().any(|p| {
+                workspace_ids.contains(&p.id) && p.name == dep.name()
+            });
+            if is_internal {
+                continue;
+            }
+
+            // Deduplicate: first workspace member that declares a dep wins.
+            if seen_names.insert(dep.name().to_string()) {
+                direct_deps.push(dep);
+            }
+        }
+
+        // Accumulate transitive counts, keeping the maximum across members.
+        for (name, count) in member_transitive {
+            let is_internal = package_map.values().any(|p| {
+                workspace_ids.contains(&p.id) && p.name == name
+            });
+            if !is_internal {
+                let entry = all_transitive_counts.entry(name).or_insert(0);
+                *entry = (*entry).max(count);
+            }
+        }
+    }
+
+    // Total count: all resolved packages that are not workspace members.
+    let total_count = resolve
+        .nodes
+        .iter()
+        .filter(|n| !workspace_ids.contains(&n.id))
+        .count();
+
     let direct_count = direct_deps.len();
 
-    // Compute max depth via BFS from root
-    let max_depth = compute_max_depth(root_id, &node_map);
+    // Max depth: the greatest depth reachable from any workspace member.
+    let max_depth = metadata
+        .workspace_members
+        .iter()
+        .map(|id| compute_max_depth(id, node_map))
+        .max()
+        .unwrap_or(0);
 
-    // Compute transitive dependency count for each direct dependency
-    let transitive_counts = compute_transitive_counts(root_node, &node_map);
-
-    let graph = DependencyGraph::new(total_count, direct_count, max_depth, transitive_counts);
+    let graph = DependencyGraph::new(
+        total_count,
+        direct_count,
+        max_depth,
+        all_transitive_counts,
+    );
 
     Ok((direct_deps, graph))
 }
 
-/// Extract direct dependencies from the root package manifest and resolve data.
+/// Extract direct dependencies from a package manifest and its resolve node.
 fn extract_direct_dependencies(
     root_package: &cargo_metadata::Package,
     root_node: &cargo_metadata::Node,
     package_map: &HashMap<&cargo_metadata::PackageId, &cargo_metadata::Package>,
 ) -> Vec<DirectDependency> {
-    // Build a set of dep package IDs from the resolve node for quick lookup
+    // Build a map from dep name → resolved package ID for quick lookup.
     let resolved_dep_ids: HashMap<&str, &cargo_metadata::PackageId> = root_node
         .deps
         .iter()
@@ -112,7 +210,6 @@ fn extract_direct_dependencies(
     for dep in &root_package.dependencies {
         let name = &dep.name;
 
-        // Determine the resolved version from the resolve graph
         let resolved_pkg = resolved_dep_ids
             .get(name.as_str())
             .and_then(|id| package_map.get(id));
@@ -146,23 +243,20 @@ fn extract_direct_dependencies(
             _ => DependencyKind::Normal,
         };
 
-        let features = dep.features.clone();
-        let uses_default_features = dep.uses_default_features;
-
         direct_deps.push(DirectDependency::new(
             name.clone(),
             version,
             source,
             kind,
-            features,
-            uses_default_features,
+            dep.features.clone(),
+            dep.uses_default_features,
         ));
     }
 
     direct_deps
 }
 
-/// Compute the maximum depth of the dependency tree using BFS.
+/// Compute the maximum depth of the dependency tree using BFS from a root node.
 fn compute_max_depth<'a>(
     root_id: &'a cargo_metadata::PackageId,
     node_map: &HashMap<&'a cargo_metadata::PackageId, &'a cargo_metadata::Node>,
@@ -199,7 +293,6 @@ fn compute_transitive_counts<'a>(
         let mut visited = HashSet::new();
         visited.insert(&dep.pkg);
         count_transitive(&dep.pkg, node_map, &mut visited);
-        // Subtract 1 because we don't count the direct dep itself
         counts.insert(name.to_string(), visited.len().saturating_sub(1));
     }
 
@@ -266,7 +359,7 @@ mod tests {
 
     #[test]
     fn load_metadata_succeeds_for_prism_workspace_member() {
-        // Use prism-deps itself as a test subject
+        // Use prism-deps itself as a test subject (a non-virtual crate).
         let path = Path::new(env!("CARGO_MANIFEST_DIR"));
         let metadata = load_metadata(path);
         assert!(
@@ -287,15 +380,8 @@ mod tests {
             result.err()
         );
         let (deps, graph) = result.unwrap();
-        // prism-deps has several dependencies
-        assert!(
-            !deps.is_empty(),
-            "prism-deps should have direct dependencies"
-        );
-        assert!(
-            graph.direct_count() > 0,
-            "should have at least one direct dependency"
-        );
+        assert!(!deps.is_empty(), "prism-deps should have direct dependencies");
+        assert!(graph.direct_count() > 0, "should have at least one direct dependency");
         assert!(
             graph.total_count() >= graph.direct_count(),
             "total count should be >= direct count"
@@ -303,11 +389,50 @@ mod tests {
     }
 
     #[test]
+    fn build_dependency_info_succeeds_for_virtual_workspace() {
+        // Use the prism workspace root (a virtual workspace) as the test subject.
+        // CARGO_MANIFEST_DIR is prism-deps; the workspace root is two levels up.
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()  // crates/
+            .and_then(|p| p.parent())  // workspace root
+            .expect("workspace root should exist");
+
+        let metadata = load_metadata(workspace_root);
+        assert!(
+            metadata.is_ok(),
+            "should load metadata for virtual workspace root: {:?}",
+            metadata.err()
+        );
+
+        let result = build_dependency_info(&metadata.unwrap());
+        assert!(
+            result.is_ok(),
+            "virtual workspace dependency analysis should not fail: {:?}",
+            result.err()
+        );
+
+        let (deps, graph) = result.unwrap();
+        // The prism workspace has external dependencies
+        assert!(!deps.is_empty(), "workspace should have external dependencies");
+        assert!(graph.direct_count() > 0, "should report at least one direct dependency");
+        assert!(graph.total_count() > 0, "should report transitive dependencies");
+
+        // Internal workspace crates should not appear in the dep list
+        let internal_names = ["prism-audit", "prism-deps", "prism-stats", "prism-map",
+                               "prism-check", "prism-cli"];
+        for internal in &internal_names {
+            assert!(
+                !deps.iter().any(|d| d.name() == *internal),
+                "internal crate {internal} should not appear in external deps"
+            );
+        }
+    }
+
+    #[test]
     fn find_duplicates_on_prism_deps() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"));
         let metadata = load_metadata(path).expect("metadata should load");
         let duplicates = find_duplicates(&metadata);
-        // Just verify the function runs without panicking and returns valid data
         for dup in &duplicates {
             assert!(
                 dup.versions().len() >= 2,
