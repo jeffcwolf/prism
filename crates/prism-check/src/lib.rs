@@ -139,11 +139,15 @@ pub fn run_checks(config: &CheckConfig) -> CheckReport {
             ));
         }
         Some(Err(e)) => {
+            // Dependency analysis failure is informational, not a correctness
+            // gate. Common causes: virtual workspace metadata quirks, missing
+            // cargo-audit, no network for crates.io queries. Warn so the user
+            // investigates, but do not block release readiness.
             results.push(types::CheckResult::new(
                 types::CheckCategory::Dependencies,
                 "dependencies".to_string(),
-                types::CheckStatus::Fail,
-                format!("Dependency analysis failed: {e}"),
+                types::CheckStatus::Warn,
+                format!("Dependency analysis could not complete: {e}"),
             ));
         }
         None => {
@@ -296,7 +300,13 @@ fn collect_file_paths(node: &prism_map::ModuleNode, set: &mut HashSet<std::path:
     }
 }
 
-/// Simple recursive directory walk for .rs files, skipping target/ and hidden dirs.
+/// Simple recursive directory walk for .rs files, skipping target/, hidden dirs,
+/// tests/, and fixture directories.
+///
+/// Integration tests in `tests/` are standalone compilation units that Rust
+/// compiles independently — they are not part of any crate's module tree and
+/// should not be counted as orphans. Test fixtures (which may contain `.rs`
+/// files used as test data) are similarly excluded.
 fn walkdir(path: &Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     let mut files = Vec::new();
     if !path.is_dir() {
@@ -306,8 +316,12 @@ fn walkdir(path: &Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Skip target, hidden dirs, and test fixtures
-        if name_str.starts_with('.') || name_str == "target" {
+        // Skip target, hidden dirs, integration tests, and test fixtures
+        if name_str.starts_with('.')
+            || name_str == "target"
+            || name_str == "tests"
+            || name_str == "fixtures"
+        {
             continue;
         }
         let path = entry.path();
