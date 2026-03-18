@@ -10,14 +10,19 @@ pub(crate) fn collect(path: &Path) -> Result<DocsStats, StatsError> {
     let mut documented_pub_items = 0u64;
     let mut doctests = 0u64;
 
-    // --- Phase 1: identify files that are only reachable through feature-gated
+    // --- Phase 1a: identify files that are only reachable through feature-gated
     //     `mod` declarations.  walkdir discovers every `.rs` file on disk, but
     //     files behind `#[cfg(feature = "…")] mod foo;` are not part of the
     //     default public API.  rustdoc never sees them unless the feature is
     //     explicitly enabled, so Prism must skip them too.
     let feature_gated_files = collect_feature_gated_module_files(path)?;
 
-    // --- Phase 2: walk and count, skipping gated files.
+    // --- Phase 1b: identify binary-only crate directories.  rustdoc does not
+    //     document binary crates (those with src/main.rs but no src/lib.rs).
+    //     `-D missing_docs` never fires on their items, so Prism must skip them.
+    let binary_crate_dirs = collect_binary_only_crate_dirs(path)?;
+
+    // --- Phase 2: walk and count, skipping gated files and binary crates.
     for entry in walkdir::WalkDir::new(path)
         .into_iter()
         .filter_entry(|e| !is_excluded(e))
@@ -27,6 +32,10 @@ pub(crate) fn collect(path: &Path) -> Result<DocsStats, StatsError> {
         if entry.path().extension().map(|e| e == "rs").unwrap_or(false) {
             // Skip files whose only inclusion path is behind cfg(feature).
             if feature_gated_files.contains(entry.path()) {
+                continue;
+            }
+            // Skip files inside binary-only crates.
+            if binary_crate_dirs.iter().any(|d| entry.path().starts_with(d)) {
                 continue;
             }
 
@@ -111,6 +120,32 @@ fn collect_feature_gated_module_files(root: &Path) -> Result<HashSet<PathBuf>, S
     }
 
     Ok(gated)
+}
+
+/// Collect directories of binary-only crates (have `src/main.rs` but no
+/// `src/lib.rs`).  rustdoc does not document binary crates, so `-D
+/// missing_docs` never fires on their public items.  Prism must skip them
+/// to match rustdoc's view.
+fn collect_binary_only_crate_dirs(root: &Path) -> Result<Vec<PathBuf>, StatsError> {
+    let mut dirs = Vec::new();
+
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e))
+    {
+        let entry = entry.map_err(|e| StatsError::file_read(root, std::io::Error::other(e)))?;
+
+        if entry.file_name() == "Cargo.toml" && entry.file_type().is_file() {
+            let crate_dir = entry.path().parent().unwrap_or(entry.path());
+            let has_main = crate_dir.join("src/main.rs").is_file();
+            let has_lib = crate_dir.join("src/lib.rs").is_file();
+            if has_main && !has_lib {
+                dirs.push(crate_dir.to_path_buf());
+            }
+        }
+    }
+
+    Ok(dirs)
 }
 
 fn is_excluded(entry: &walkdir::DirEntry) -> bool {
@@ -520,6 +555,53 @@ pub fn experimental_api() {}
             stats.total_pub_items, 1,
             "cfg(feature) top-level items must not be counted"
         );
+    }
+
+    #[test]
+    fn does_not_count_pub_items_in_binary_only_crates() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // A library crate with one documented pub item
+        fs::create_dir_all(root.join("crates/mylib/src")).unwrap();
+        fs::write(
+            root.join("crates/mylib/Cargo.toml"),
+            "[package]\nname=\"mylib\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/mylib/src/lib.rs"),
+            "/// Documented.\npub fn lib_fn() {}\n",
+        )
+        .unwrap();
+
+        // A binary-only crate (main.rs, no lib.rs) with undocumented pub items
+        fs::create_dir_all(root.join("crates/mycli/src")).unwrap();
+        fs::write(
+            root.join("crates/mycli/Cargo.toml"),
+            "[package]\nname=\"mycli\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/mycli/src/main.rs"),
+            "pub fn cli_helper() {}\nfn main() {}\n",
+        )
+        .unwrap();
+
+        // Workspace Cargo.toml
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.total_pub_items, 1,
+            "binary-only crate pub items must not be counted"
+        );
+        assert_eq!(stats.documented_pub_items, 1);
+        assert!((stats.coverage_pct - 100.0).abs() < 1.0);
     }
 
     #[test]
