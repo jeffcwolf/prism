@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
@@ -9,6 +10,14 @@ pub(crate) fn collect(path: &Path) -> Result<DocsStats, StatsError> {
     let mut documented_pub_items = 0u64;
     let mut doctests = 0u64;
 
+    // --- Phase 1: identify files that are only reachable through feature-gated
+    //     `mod` declarations.  walkdir discovers every `.rs` file on disk, but
+    //     files behind `#[cfg(feature = "…")] mod foo;` are not part of the
+    //     default public API.  rustdoc never sees them unless the feature is
+    //     explicitly enabled, so Prism must skip them too.
+    let feature_gated_files = collect_feature_gated_module_files(path)?;
+
+    // --- Phase 2: walk and count, skipping gated files.
     for entry in walkdir::WalkDir::new(path)
         .into_iter()
         .filter_entry(|e| !is_excluded(e))
@@ -16,6 +25,11 @@ pub(crate) fn collect(path: &Path) -> Result<DocsStats, StatsError> {
         let entry = entry.map_err(|e| StatsError::file_read(path, std::io::Error::other(e)))?;
 
         if entry.path().extension().map(|e| e == "rs").unwrap_or(false) {
+            // Skip files whose only inclusion path is behind cfg(feature).
+            if feature_gated_files.contains(entry.path()) {
+                continue;
+            }
+
             let content = std::fs::read_to_string(entry.path())
                 .map_err(|e| StatsError::file_read(entry.path(), e))?;
 
@@ -44,6 +58,59 @@ pub(crate) fn collect(path: &Path) -> Result<DocsStats, StatsError> {
         coverage_pct,
         doctests,
     })
+}
+
+/// Walk the project tree and collect absolute paths of `.rs` files that are
+/// only included via a feature-gated external module declaration.
+///
+/// For each file that contains `#[cfg(feature = "…")] mod foo;` (an external
+/// module — no body braces), we resolve `foo.rs` and `foo/mod.rs` relative to
+/// the file's parent directory and add them to the exclusion set.
+fn collect_feature_gated_module_files(root: &Path) -> Result<HashSet<PathBuf>, StatsError> {
+    let mut gated: HashSet<PathBuf> = HashSet::new();
+
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e))
+    {
+        let entry = entry.map_err(|e| StatsError::file_read(root, std::io::Error::other(e)))?;
+
+        if entry.path().extension().map(|e| e == "rs").unwrap_or(false) {
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| StatsError::file_read(entry.path(), e))?;
+
+            let file = match syn::parse_file(&content) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            let parent_dir = entry.path().parent().unwrap_or(entry.path());
+
+            for item in &file.items {
+                if let syn::Item::Mod(item_mod) = item {
+                    // Only external modules (declared with `;`, no inline body).
+                    if item_mod.content.is_some() {
+                        continue;
+                    }
+                    if has_cfg_feature_attr(&item_mod.attrs) {
+                        let mod_name = item_mod.ident.to_string();
+                        // Rust's module resolution: `foo.rs` or `foo/mod.rs`.
+                        let candidate_file = parent_dir.join(format!("{mod_name}.rs"));
+                        let candidate_dir = parent_dir.join(&mod_name).join("mod.rs");
+
+                        if candidate_file.is_file() {
+                            gated.insert(candidate_file.canonicalize().unwrap_or(candidate_file));
+                        }
+                        if candidate_dir.is_file() {
+                            gated.insert(candidate_dir.canonicalize().unwrap_or(candidate_dir));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(gated)
 }
 
 fn is_excluded(entry: &walkdir::DirEntry) -> bool {
@@ -78,6 +145,12 @@ impl DocsVisitor {
         if !is_fully_public(vis) {
             return;
         }
+        // Items behind #[cfg(feature = "…")] are not part of the default public
+        // API.  rustdoc only documents them when the feature is explicitly
+        // enabled.  Skip them so Prism's count matches rustdoc's.
+        if has_cfg_feature_attr(attrs) {
+            return;
+        }
         self.total_pub += 1;
         let has_doc = attrs.iter().any(|a| a.path().is_ident("doc"));
         if has_doc {
@@ -100,6 +173,30 @@ fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("test") {
                 found = true;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
+/// Detect `#[cfg(feature = "…")]` on an item.
+///
+/// Uses `parse_nested_meta` to walk the cfg predicate.  Matches plain
+/// `cfg(feature = "…")` as well as compound predicates that mention `feature`
+/// anywhere (e.g. `cfg(all(feature = "x", unix))`).  This conservative approach
+/// ensures we never count an item that requires a non-default feature to compile.
+fn has_cfg_feature_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("feature") {
+                found = true;
+                // Consume the `= "value"` part so the parser doesn't choke.
+                let _ = meta.value().and_then(|v| v.parse::<syn::LitStr>());
             }
             Ok(())
         });
@@ -189,6 +286,13 @@ impl<'ast> Visit<'ast> for DocsVisitor {
         // the documented public API surface. rustdoc ignores them under
         // -D missing_docs; Prism must match.
         if has_cfg_test_attr(&node.attrs) {
+            return;
+        }
+        // Skip #[cfg(feature = "…")] modules — they are not compiled (and
+        // therefore not documented by rustdoc) unless the feature is
+        // explicitly enabled.  This handles inline modules; external module
+        // *files* are excluded at the walkdir level by Phase 1.
+        if has_cfg_feature_attr(&node.attrs) {
             return;
         }
         self.check_item_attrs(&node.vis, &node.attrs);
@@ -302,6 +406,120 @@ mod tests {
         );
         assert_eq!(stats.documented_pub_items, 1);
         assert!((stats.coverage_pct - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn does_not_count_pub_items_in_cfg_feature_inline_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+/// A documented function.
+pub fn documented() {}
+
+/// Another documented function.
+pub fn also_documented() {}
+
+#[cfg(feature = "test-utils")]
+pub mod mocks {
+    pub struct MockClient;
+    pub fn mock_helper() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.total_pub_items, 2,
+            "cfg(feature) inline module pub items must not be counted"
+        );
+        assert_eq!(stats.documented_pub_items, 2);
+        assert!((stats.coverage_pct - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn does_not_count_pub_items_in_cfg_feature_external_module_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        // lib.rs: one documented pub fn + a feature-gated external module
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+/// A documented function.
+pub fn documented() {}
+
+#[cfg(feature = "test-utils")]
+pub mod mock;
+"#,
+        )
+        .unwrap();
+        // mock.rs: undocumented pub items that should NOT count
+        fs::write(
+            root.join("src/mock.rs"),
+            r#"
+pub struct MockClient;
+pub struct AnotherMock;
+pub fn mock_helper() {}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.total_pub_items, 1,
+            "pub items in feature-gated external module file must not be counted"
+        );
+        assert_eq!(stats.documented_pub_items, 1);
+        assert!((stats.coverage_pct - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn does_not_count_cfg_feature_items_at_top_level() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+/// Documented function.
+pub fn documented() {}
+
+#[cfg(feature = "test-utils")]
+pub use mock::{MockA, MockB};
+
+#[cfg(feature = "unstable")]
+pub fn experimental_api() {}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        // Only the non-gated `documented` should count.
+        // `pub use` is not visited by DocsVisitor (no visit_item_use),
+        // and `experimental_api` is behind cfg(feature).
+        assert_eq!(
+            stats.total_pub_items, 1,
+            "cfg(feature) top-level items must not be counted"
+        );
     }
 
     #[test]

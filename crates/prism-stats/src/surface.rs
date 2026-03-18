@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
@@ -8,6 +9,10 @@ pub(crate) fn collect(path: &Path) -> Result<SurfaceStats, StatsError> {
     let mut pub_items = 0u64;
     let mut total_items = 0u64;
 
+    // Phase 1: identify files only reachable through feature-gated module
+    // declarations, so we can skip them in Phase 2.
+    let feature_gated_files = collect_feature_gated_module_files(path)?;
+
     for entry in walkdir::WalkDir::new(path)
         .into_iter()
         .filter_entry(|e| !is_excluded(e))
@@ -15,6 +20,10 @@ pub(crate) fn collect(path: &Path) -> Result<SurfaceStats, StatsError> {
         let entry = entry.map_err(|e| StatsError::file_read(path, std::io::Error::other(e)))?;
 
         if entry.path().extension().map(|e| e == "rs").unwrap_or(false) {
+            if feature_gated_files.contains(entry.path()) {
+                continue;
+            }
+
             let content = std::fs::read_to_string(entry.path())
                 .map_err(|e| StatsError::file_read(entry.path(), e))?;
 
@@ -43,6 +52,53 @@ pub(crate) fn collect(path: &Path) -> Result<SurfaceStats, StatsError> {
     })
 }
 
+/// Walk the project tree and collect absolute paths of `.rs` files that are
+/// only included via a feature-gated external module declaration.
+fn collect_feature_gated_module_files(root: &Path) -> Result<HashSet<PathBuf>, StatsError> {
+    let mut gated: HashSet<PathBuf> = HashSet::new();
+
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e))
+    {
+        let entry = entry.map_err(|e| StatsError::file_read(root, std::io::Error::other(e)))?;
+
+        if entry.path().extension().map(|e| e == "rs").unwrap_or(false) {
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| StatsError::file_read(entry.path(), e))?;
+
+            let file = match syn::parse_file(&content) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            let parent_dir = entry.path().parent().unwrap_or(entry.path());
+
+            for item in &file.items {
+                if let syn::Item::Mod(item_mod) = item {
+                    if item_mod.content.is_some() {
+                        continue;
+                    }
+                    if has_cfg_feature_attr(&item_mod.attrs) {
+                        let mod_name = item_mod.ident.to_string();
+                        let candidate_file = parent_dir.join(format!("{mod_name}.rs"));
+                        let candidate_dir = parent_dir.join(&mod_name).join("mod.rs");
+
+                        if candidate_file.is_file() {
+                            gated.insert(candidate_file.canonicalize().unwrap_or(candidate_file));
+                        }
+                        if candidate_dir.is_file() {
+                            gated.insert(candidate_dir.canonicalize().unwrap_or(candidate_dir));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(gated)
+}
+
 fn is_excluded(entry: &walkdir::DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
@@ -69,7 +125,11 @@ struct SurfaceVisitor {
 }
 
 impl SurfaceVisitor {
-    fn count_item(&mut self, vis: &syn::Visibility) {
+    fn count_item(&mut self, vis: &syn::Visibility, attrs: &[syn::Attribute]) {
+        // Items behind cfg(feature) are not part of the default API surface.
+        if has_cfg_feature_attr(attrs) {
+            return;
+        }
         self.total_items += 1;
         if is_fully_public(vis) {
             self.pub_items += 1;
@@ -97,50 +157,71 @@ fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// Detect `#[cfg(feature = "…")]` on an item.
+fn has_cfg_feature_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("feature") {
+                found = true;
+                let _ = meta.value().and_then(|v| v.parse::<syn::LitStr>());
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
 impl<'ast> Visit<'ast> for SurfaceVisitor {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_fn(self, node);
     }
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_struct(self, node);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_enum(self, node);
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_trait(self, node);
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_type(self, node);
     }
 
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_const(self, node);
     }
 
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        self.count_item(&node.vis);
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_static(self, node);
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         // Skip #[cfg(test)] modules — items inside them are not part of the
-        // exported API surface. Counting them inflates both total_items and
-        // pub_items relative to what rustdoc and users actually see.
+        // exported API surface.
         if has_cfg_test_attr(&node.attrs) {
             return;
         }
-        self.count_item(&node.vis);
+        // Skip #[cfg(feature = "…")] modules — not compiled by default.
+        if has_cfg_feature_attr(&node.attrs) {
+            return;
+        }
+        self.count_item(&node.vis, &node.attrs);
         syn::visit::visit_item_mod(self, node);
     }
 }
@@ -216,6 +297,85 @@ mod tests {
         assert_eq!(
             stats.total_items, 2,
             "cfg(test) items must not inflate total_items"
+        );
+    }
+
+    #[test]
+    fn does_not_count_items_in_cfg_feature_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn public_fn() {}
+fn private_fn() {}
+
+#[cfg(feature = "test-utils")]
+pub mod mocks {
+    pub struct MockClient;
+    pub fn mock_helper() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.pub_items, 1,
+            "cfg(feature) pub items must not inflate pub_items"
+        );
+        assert_eq!(
+            stats.total_items, 2,
+            "cfg(feature) items must not inflate total_items"
+        );
+    }
+
+    #[test]
+    fn does_not_count_items_in_cfg_feature_external_module_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn public_fn() {}
+fn private_fn() {}
+
+#[cfg(feature = "test-utils")]
+pub mod mock;
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/mock.rs"),
+            r#"
+pub struct MockClient;
+pub fn mock_helper() {}
+fn internal() {}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.pub_items, 1,
+            "pub items in feature-gated external module file must not be counted"
+        );
+        // total_items: pub fn + fn from lib.rs only (2), mock.rs items excluded
+        assert_eq!(
+            stats.total_items, 2,
+            "items in feature-gated external module file must not be counted"
         );
     }
 
