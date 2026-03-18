@@ -99,10 +99,10 @@ fn collect_feature_gated_module_files(root: &Path) -> Result<HashSet<PathBuf>, S
                         let candidate_dir = parent_dir.join(&mod_name).join("mod.rs");
 
                         if candidate_file.is_file() {
-                            gated.insert(candidate_file.canonicalize().unwrap_or(candidate_file));
+                            gated.insert(candidate_file);
                         }
                         if candidate_dir.is_file() {
-                            gated.insert(candidate_dir.canonicalize().unwrap_or(candidate_dir));
+                            gated.insert(candidate_dir);
                         }
                     }
                 }
