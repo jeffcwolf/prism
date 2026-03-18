@@ -51,6 +51,11 @@ fn is_excluded(entry: &walkdir::DirEntry) -> bool {
     if name == "target" || name.starts_with('.') || name == "node_modules" {
         return true;
     }
+    // Exclude integration test directories. Public items in tests/ inflate the
+    // pub surface ratio; they are not part of the exported API.
+    if name == "tests" && entry.file_type().is_dir() {
+        return true;
+    }
     if name == "fixtures" {
         return entry.path().components().any(|c| c.as_os_str() == "tests");
     }
@@ -119,6 +124,34 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn does_not_count_pub_items_in_tests_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn public_fn() {}\nfn private_fn() {}\n",
+        )
+        .unwrap();
+        // This pub item must not be counted in the pub surface ratio
+        fs::write(
+            root.join("tests/integration.rs"),
+            "pub fn test_helper() {}\n",
+        )
+        .unwrap();
+    
+        let stats = collect(root).unwrap();
+        assert_eq!(stats.pub_items, 1, "pub items in tests/ must not inflate pub_ratio");
+        assert_eq!(stats.total_items, 2, "only src/ items counted");
+    }
+    
     #[test]
     fn counts_pub_and_total_items() {
         let dir = TempDir::new().unwrap();

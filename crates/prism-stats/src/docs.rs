@@ -54,6 +54,12 @@ fn is_excluded(entry: &walkdir::DirEntry) -> bool {
     if name == "target" || name.starts_with('.') || name == "node_modules" {
         return true;
     }
+    // Exclude integration test directories. Public items in tests/ are test
+    // helpers, not part of the documented public API surface. rustdoc ignores
+    // them under -D missing_docs; Prism must match.
+    if name == "tests" && entry.file_type().is_dir() {
+        return true;
+    }
     if name == "fixtures" {
         return entry.path().components().any(|c| c.as_os_str() == "tests");
     }
@@ -208,6 +214,36 @@ pub(crate) fn internal() {}
         );
     }
 
+    #[test]
+    fn does_not_count_pub_items_in_tests_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        // Documented pub item in src/ — must count
+        fs::write(
+            root.join("src/lib.rs"),
+            "/// A documented function.\npub fn documented() {}\n",
+        )
+        .unwrap();
+        // Undocumented pub item in tests/ — must NOT count against coverage
+        fs::write(
+            root.join("tests/integration.rs"),
+            "pub fn undocumented_test_helper() {}\n",
+        )
+        .unwrap();
+    
+        let stats = collect(root).unwrap();
+        assert_eq!(stats.total_pub_items, 1, "pub items in tests/ must not be counted");
+        assert_eq!(stats.documented_pub_items, 1);
+        assert!((stats.coverage_pct - 100.0).abs() < 1.0);
+    }
+    
     #[test]
     fn counts_doctests_in_doc_comments() {
         let dir = TempDir::new().unwrap();
