@@ -81,6 +81,22 @@ fn is_fully_public(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_))
 }
 
+fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("test") {
+                found = true;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
 impl<'ast> Visit<'ast> for SurfaceVisitor {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         self.count_item(&node.vis);
@@ -116,6 +132,17 @@ impl<'ast> Visit<'ast> for SurfaceVisitor {
         self.count_item(&node.vis);
         syn::visit::visit_item_static(self, node);
     }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // Skip #[cfg(test)] modules — items inside them are not part of the
+        // exported API surface. Counting them inflates both total_items and
+        // pub_items relative to what rustdoc and users actually see.
+        if has_cfg_test_attr(&node.attrs) {
+            return;
+        }
+        self.count_item(&node.vis);
+        syn::visit::visit_item_mod(self, node);
+    }
 }
 
 #[cfg(test)]
@@ -146,12 +173,52 @@ mod tests {
             "pub fn test_helper() {}\n",
         )
         .unwrap();
-    
+
         let stats = collect(root).unwrap();
-        assert_eq!(stats.pub_items, 1, "pub items in tests/ must not inflate pub_ratio");
+        assert_eq!(
+            stats.pub_items, 1,
+            "pub items in tests/ must not inflate pub_ratio"
+        );
         assert_eq!(stats.total_items, 2, "only src/ items counted");
     }
-    
+
+    #[test]
+    fn does_not_count_items_in_cfg_test_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn public_fn() {}
+fn private_fn() {}
+
+#[cfg(test)]
+mod tests {
+    // These must not be counted in pub_items or total_items.
+    pub fn test_helper() {}
+    fn internal_helper() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.pub_items, 1,
+            "cfg(test) pub items must not inflate pub_items"
+        );
+        assert_eq!(
+            stats.total_items, 2,
+            "cfg(test) items must not inflate total_items"
+        );
+    }
+
     #[test]
     fn counts_pub_and_total_items() {
         let dir = TempDir::new().unwrap();

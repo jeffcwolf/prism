@@ -91,6 +91,22 @@ fn is_fully_public(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_))
 }
 
+fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("test") {
+                found = true;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
 fn count_doctests_in_attrs(attrs: &[syn::Attribute]) -> u64 {
     let mut count = 0u64;
     let mut in_code_fence = false;
@@ -169,6 +185,12 @@ impl<'ast> Visit<'ast> for DocsVisitor {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // Skip #[cfg(test)] modules — pub items inside them are not part of
+        // the documented public API surface. rustdoc ignores them under
+        // -D missing_docs; Prism must match.
+        if has_cfg_test_attr(&node.attrs) {
+            return;
+        }
         self.check_item_attrs(&node.vis, &node.attrs);
         syn::visit::visit_item_mod(self, node);
     }
@@ -237,13 +259,51 @@ pub(crate) fn internal() {}
             "pub fn undocumented_test_helper() {}\n",
         )
         .unwrap();
-    
+
         let stats = collect(root).unwrap();
-        assert_eq!(stats.total_pub_items, 1, "pub items in tests/ must not be counted");
+        assert_eq!(
+            stats.total_pub_items, 1,
+            "pub items in tests/ must not be counted"
+        );
         assert_eq!(stats.documented_pub_items, 1);
         assert!((stats.coverage_pct - 100.0).abs() < 1.0);
     }
-    
+
+    #[test]
+    fn does_not_count_pub_items_in_cfg_test_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+/// A documented function.
+pub fn documented() {}
+
+#[cfg(test)]
+mod tests {
+    // These pub helpers must not count against doc coverage.
+    pub fn test_helper() {}
+    pub fn another_helper() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let stats = collect(root).unwrap();
+        assert_eq!(
+            stats.total_pub_items, 1,
+            "cfg(test) pub items must not be counted"
+        );
+        assert_eq!(stats.documented_pub_items, 1);
+        assert!((stats.coverage_pct - 100.0).abs() < 1.0);
+    }
+
     #[test]
     fn counts_doctests_in_doc_comments() {
         let dir = TempDir::new().unwrap();
