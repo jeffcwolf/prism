@@ -29,8 +29,7 @@ pub(crate) fn check_staleness(name: &str, current_version: &str) -> Option<Stale
         return None;
     }
 
-    let is_major_behind = latest_parsed.major > current.major + 1
-        || (latest_parsed.major > current.major && current.major > 0);
+    let is_major_behind = latest_parsed.major > current.major;
 
     Some(StalenessInfo::new(
         current_version.to_string(),
